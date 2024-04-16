@@ -11,13 +11,14 @@ from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 from data.imagnet_prompts import imagenet_classes
 from data.fewshot_datasets import fewshot_datasets
 from data.cls_to_names import *
+from transformers import AutoTokenizer, XCLIPProcessor, XCLIPModel
 
 _tokenizer = _Tokenizer()
 
 DOWNLOAD_ROOT='~/.cache/clip'
 
 class ClipImageEncoder(nn.Module):
-    def __init__(self, device, arch="ViT-L/14", image_resolution=224, n_class=1000):
+    def __init__(self, device, arch="ViT-L/14", image_resolution=224, n_class=8):
         super(ClipImageEncoder, self).__init__()
         clip, embed_dim, _ = load(arch, device=device, download_root=DOWNLOAD_ROOT)
         self.encoder = clip.visual
@@ -39,9 +40,9 @@ class ClipImageEncoder(nn.Module):
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
-        self.transformer = clip_model.transformer
-        self.positional_embedding = clip_model.positional_embedding
-        self.ln_final = clip_model.ln_final
+        self.transformer = clip_model.text_model.embeddings
+        self.positional_embedding = clip_model.text_model.embeddings.position_embedding
+        self.ln_final = clip_model.text_model.final_layer_norm
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
@@ -64,10 +65,10 @@ class PromptLearner(nn.Module):
         super().__init__()
         n_cls = len(classnames)
         self.learned_cls = learned_cls
-        dtype = clip_model.dtype
+        dtype = clip_model.vision_model.embeddings.patch_embedding.weight.dtype
         self.dtype = dtype
-        self.device = clip_model.visual.conv1.weight.device
-        ctx_dim = clip_model.ln_final.weight.shape[0]
+        self.device = clip_model.vision_model.embeddings.patch_embedding.weight.device
+        ctx_dim = clip_model.text_model.final_layer_norm.weight.shape[0]
         self.ctx_dim = ctx_dim
         self.batch_size = batch_size
 
@@ -88,7 +89,7 @@ class PromptLearner(nn.Module):
             n_ctx = len(ctx_init.split(" "))
             prompt = tokenize(ctx_init).to(self.device)
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
+                embedding = clip_model.text_model.embeddings.token_embedding(prompt).type(dtype)
             ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
             prompt_prefix = ctx_init
         else:
@@ -125,7 +126,7 @@ class PromptLearner(nn.Module):
 
         tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            embedding = clip_model.text_model.embeddings.token_embedding(tokenized_prompts).type(dtype)
 
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
@@ -168,10 +169,11 @@ class PromptLearner(nn.Module):
             self.cls_init_state = cls_vectors.detach().clone()
         tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
 
-        clip, _, _ = load(arch, device=self.device, download_root=DOWNLOAD_ROOT)
+        model_name = "microsoft/xclip-base-patch32"
+        clip_model = XCLIPModel.from_pretrained(model_name).to(self.device)
 
         with torch.no_grad():
-            embedding = clip.token_embedding(tokenized_prompts).type(self.dtype)
+            embedding = clip_model.text_model.embeddings.token_embedding(tokenized_prompts).type(self.dtype)
 
         self.token_prefix = embedding[:, :1, :]
         self.token_suffix = embedding[:, 1 + self.n_ctx :, :]  # CLS, EOS
@@ -185,14 +187,14 @@ class PromptLearner(nn.Module):
         if init is not None:
             ctx = init
         else:
-            ctx = self.ctx
+            ctx = self.ctx.to(self.device)
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
         elif not ctx.size()[0] == self.n_cls:
             ctx = ctx.unsqueeze(1).expand(-1, self.n_cls, -1, -1)
 
-        prefix = self.token_prefix
-        suffix = self.token_suffix
+        prefix = self.token_prefix.to(self.device)
+        suffix = self.token_suffix.to(self.device)
         if self.batch_size is not None: 
             # This way only works for single-gpu setting (could pass batch size as an argument for forward())
             prefix = prefix.repeat(self.batch_size, 1, 1, 1)
@@ -278,17 +280,27 @@ class ClipTestTimeTuning(nn.Module):
     def __init__(self, device, classnames, batch_size, criterion='cosine', arch="ViT-L/14",
                         n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False):
         super(ClipTestTimeTuning, self).__init__()
-        clip, _, _ = load(arch, device=device, download_root=DOWNLOAD_ROOT)
-        self.image_encoder = clip.visual
-        self.text_encoder = TextEncoder(clip)
-        self.logit_scale = clip.logit_scale.data
+        model_name = "microsoft/xclip-base-patch32"
+        self.processor = XCLIPProcessor.from_pretrained("microsoft/xclip-base-patch32")
+        xclip = XCLIPModel.from_pretrained(model_name).to(device)
+        self.xclip = xclip
+        self.text_encoder = xclip.text_model.embeddings
+        self.image_encoder = xclip.vision_model
+        self.get_video_features = xclip.get_video_features
+        self.logit_scale = xclip.logit_scale.data
+        self.device = device
+
+        #clip, _, _ = load(arch, device=device, download_root=DOWNLOAD_ROOT)
+        #self.image_encoder = clip.visual
+        #self.text_encoder = TextEncoder(clip)
+        #self.logit_scale = clip.logit_scale.data
         # prompt tuning
-        self.prompt_learner = PromptLearner(clip, classnames, batch_size, n_ctx, ctx_init, ctx_position, learned_cls)
+        self.prompt_learner = PromptLearner(xclip, classnames, batch_size, n_ctx, ctx_init, ctx_position, learned_cls)
         self.criterion = criterion
         
     @property
     def dtype(self):
-        return self.image_encoder.conv1.weight.dtype
+        return self.image_encoder.embeddings.patch_embedding.weight.dtype
 
     # restore the initial state of the prompt_learner (tunable prompt)
     def reset(self):
@@ -319,6 +331,29 @@ class ClipTestTimeTuning(nn.Module):
 
         return logits
 
+    def xclip_get_text_feature(self):
+        prompts = self.prompt_learner()
+        embedding = self.text_encoder(input_ids = None, inputs_embeds = prompts)
+        tokenized_prompts = self.prompt_learner.tokenized_prompts
+
+        return [embedding,tokenized_prompts]
+    
+    def xclip_inference(self, videos):
+        embedding, tokenized_prompts = self.xclip_get_text_feature()
+        #videos = torch.clamp(videos, 0, 1)
+        #videos = torch.squeeze(videos) #batchsize=1
+        #videos = videos.permute(1,0,2,3,4) #batchsize>1
+        #videos = [video for video in videos]
+        inputs = self.processor(videos=list(videos), return_tensors="pt", do_rescale=False)
+        #input_ids = tokenized_prompts.to(self.device)
+        #pixel_values = inputs["pixel_values"].to(self.device)
+        #embedding = embedding.to(self.device)
+        inputs["embedding"] = embedding.to(self.device)
+        inputs["pixel_values"] = inputs["pixel_values"].to(self.device).requires_grad_(True)
+        inputs["input_ids"] = tokenized_prompts.to(self.device)
+        output = self.xclip(**inputs)
+        return output.logits_per_video
+
     def forward(self, input):
         if isinstance(input, Tuple):
             view_0, view_1, view_2 = input
@@ -326,7 +361,7 @@ class ClipTestTimeTuning(nn.Module):
         elif len(input.size()) == 2:
             return self.directional_prompt_tuning(input)
         else:
-            return self.inference(input)
+            return self.xclip_inference(input)
 
 
 def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, learned_cls=False):

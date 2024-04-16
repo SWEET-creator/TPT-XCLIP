@@ -19,3 +19,5 @@ thumbs.db
 .DS_Store
 .idea
 *.log
+dataset
+~/.cache/clip/RN50.pt

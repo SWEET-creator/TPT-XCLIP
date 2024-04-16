@@ -26,6 +26,7 @@ import torchvision.models as models
 from clip.custom_clip import get_coop
 from clip.cocoop import get_cocoop
 from data.imagnet_prompts import imagenet_classes
+from data.target_prompts import target_classes
 from data.datautils import AugMixAugmenter, build_dataset
 from utils.tools import Summary, AverageMeter, ProgressMeter, accuracy, load_model_weight, set_random_seed
 from data.cls_to_names import *
@@ -50,7 +51,6 @@ def avg_entropy(outputs):
     avg_logits = torch.clamp(avg_logits, min=min_real)
     return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1)
 
-
 def test_time_tuning(model, inputs, optimizer, scaler, args):
     if args.cocoop:
         image_feature, pgen_ctx = inputs
@@ -60,17 +60,27 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
     selected_idx = None
     for j in range(args.tta_steps):
         with torch.cuda.amp.autocast():
-            if args.cocoop:
-                output = model((image_feature, pgen_ctx))
+            if args.tpt:
+                outputs = []
+                for input in inputs:
+                    if input.shape[0] == 8:
+                        if args.cocoop:
+                            output = model((image_feature, pgen_ctx))
+                        else:
+                            output = model(input) 
+                        output = output.squeeze(0)
+                        outputs.append(output.to('cuda'))
+                outputs = torch.stack(outputs)
             else:
-                output = model(inputs) 
-
+                outputs = model(inputs) 
+            #print("outputs", outputs)
+            #print(outputs.shape)
             if selected_idx is not None:
-                output = output[selected_idx]
+                outputs = outputs[selected_idx]
             else:
-                output, selected_idx = select_confident_samples(output, args.selection_p)
-
-            loss = avg_entropy(output)
+                outputs, selected_idx = select_confident_samples(outputs, args.selection_p)
+            #print("outputs", outputs)
+            loss = avg_entropy(outputs)
         
         optimizer.zero_grad()
         # compute gradient and do SGD step
@@ -80,7 +90,6 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
         scaler.update()
     if args.cocoop:
         return pgen_ctx
-
     return
 
 
@@ -167,16 +176,18 @@ def main_worker(gpu, args):
                 transforms.CenterCrop(args.resolution)])
             preprocess = transforms.Compose([
                 transforms.ToTensor(),
-                normalize])
+                transforms.Lambda(lambda x: torch.clamp(x, 0, 1))
+            ])
             data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1, 
                                             augmix=len(set_id)>1)
-            batchsize = 1
+            print(set_id)
+            batchsize = 8  #batchsize=1 -> フレーム数
         else:
             data_transform = transforms.Compose([
                 transforms.Resize(args.resolution, interpolation=BICUBIC),
                 transforms.CenterCrop(args.resolution),
                 transforms.ToTensor(),
-                normalize,
+                #normalize,
             ])
             batchsize = args.batch_size
 
@@ -212,9 +223,9 @@ def main_worker(gpu, args):
         print("number of test samples: {}".format(len(val_dataset)))
         val_loader = torch.utils.data.DataLoader(
                     val_dataset,
-                    batch_size=batchsize, shuffle=True,
+                    batch_size=batchsize, shuffle=False,
                     num_workers=args.workers, pin_memory=True)
-            
+        
         results[set_id] = test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args)
         del val_dataset, val_loader
         try:
@@ -251,6 +262,13 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             model.reset()
     end = time.time()
     for i, (images, target) in enumerate(val_loader):
+        target = torch.tensor([int(target.float().mean())]) 
+        #print(len(images), len(images[0]), len(images[0][0]), len(images[0][0][0])) #8 64 3 224
+        if args.tpt:
+            images = torch.stack(images) 
+        images = torch.clamp(images, 0, 1)
+        #images = images.permute(0,1,2,3,4)
+        # print(images.shape) # torch.Size([64, 8, 3, 224, 224])
         assert args.gpu is not None
         if isinstance(images, list):
             for k in range(len(images)):
@@ -259,13 +277,16 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
         else:
             if len(images.size()) > 4:
                 # when using ImageNet Sampler as the dataset
-                assert images.size()[0] == 1
+                #assert images.size()[0] == 1
                 images = images.squeeze(0)
             images = images.cuda(args.gpu, non_blocking=True)
-            image = images
+            if args.tpt:
+                image = images[0]
+            else:
+                image = images
         target = target.cuda(args.gpu, non_blocking=True)
-        if args.tpt:
-            images = torch.cat(images, dim=0)
+        #if args.tpt:
+        #    images = torch.cat(images, dim=0)
 
         # reset the tunable prompt to its initial state
         if not args.cocoop: # no need to reset cocoop because it's fixed
@@ -291,6 +312,7 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
                 if args.cocoop:
                     output = model((image_feature, pgen_ctx))
                 else:
+                    #print(image.shape)
                     output = model(image)
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -327,7 +349,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', default=0, type=int,
                         help='GPU id to use.')
     parser.add_argument('--tpt', action='store_true', default=False, help='run test-time prompt tuning')
-    parser.add_argument('--selection_p', default=0.1, type=float, help='confidence selection percentile')
+    parser.add_argument('--selection_p', default=0.5, type=float, help='confidence selection percentile')
     parser.add_argument('--tta_steps', default=1, type=int, help='test-time-adapt steps')
     parser.add_argument('--n_ctx', default=4, type=int, help='number of tunable tokens')
     parser.add_argument('--ctx_init', default=None, type=str, help='init tunable prompts')

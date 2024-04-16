@@ -52,7 +52,7 @@ fewshot_datasets = ['DTD', 'Flower102', 'Food101', 'Cars', 'SUN397',
 
 path_dict = {
     # dataset_name: ["image_dir", "json_split_file"]
-    "flower102": ["jpg", "data/data_splits/split_zhou_OxfordFlowers.json"],
+    "flower102": ["jpg", "dataset/Flower102/split_zhou_OxfordFlowers.json"],
     "food101": ["images", "data/data_splits/split_zhou_Food101.json"],
     "dtd": ["images", "data/data_splits/split_zhou_DescribableTextures.json"],
     "pets": ["", "data/data_splits/split_zhou_OxfordPets.json"],
@@ -60,7 +60,9 @@ path_dict = {
     "caltech101": ["", "data/data_splits/split_zhou_Caltech101.json"],
     "ucf101": ["", "data/data_splits/split_zhou_UCF101.json"],
     "cars": ["", "data/data_splits/split_zhou_StanfordCars.json"],
-    "eurosat": ["", "data/data_splits/split_zhou_EuroSAT.json"]
+    "eurosat": ["", "data/data_splits/split_zhou_EuroSAT.json"],
+    "T": ["target", "data/data_splits/split_zhou_EuroSAT.json"],
+    "target": ["", "./dataset/target/target.json"],
 }
 
 def build_fewshot_dataset(set_id, root, transform, mode='train', n_shot=None):

@@ -32,7 +32,8 @@ ID_to_DIRNAME={
     'food101': 'Food101',
     'sun397': 'SUN397',
     'aircraft': 'fgvc_aircraft',
-    'eurosat': 'eurosat'
+    'eurosat': 'eurosat',
+    'target': 'target'
 }
 
 def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split="all", bongard_anno=False):
@@ -52,6 +53,11 @@ def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split=
         assert isinstance(transform, Tuple)
         base_transform, query_transform = transform
         testset = BongardDataset(data_root, split, mode, base_transform, query_transform, bongard_anno)
+    elif set_id == "target":
+        if mode == 'train' and n_shot:
+            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
+        else:
+            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
     else:
         raise NotImplementedError
         
